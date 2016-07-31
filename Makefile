@@ -1,16 +1,12 @@
-include ${PWD}/sonLib/include.mk
+include ../sonLib/include.mk
 
 
-all: ${PWD}/randomGraphCollapse
+all: randomGraphCollapse
 
 
-${PWD}/randomGraphCollapse: ${PWD}/randomGraphCollapse.c ${PWD}/sonLib/lib/sonLib.a
-	${cxx} ${cflags} -Werror -I ${PWD}/sonLib/lib -o ${PWD}/randomGraphCollapse randomGraphCollapse.c ${PWD}/sonLib/lib/sonLib.a -lm
-
-
-${PWD}/sonLib/lib/sonLib.a:
-	cd ${PWD}/sonLib && make
+randomGraphCollapse: randomGraphCollapse.c ../sonLib/lib/sonLib.a
+	${cxx} ${cflags} -Werror -I ../sonLib/lib -o randomGraphCollapse randomGraphCollapse.c ../sonLib/lib/sonLib.a -lm
 
 clean:
-	rm ${PWD}/randomGraphCollapse
+	rm randomGraphCollapse
 
