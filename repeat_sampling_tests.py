@@ -48,7 +48,7 @@ def getChunks(job, options, sequenceIDs):
     return [job.fileStore.writeGlobalFile(chunk) for chunk in chunks]
 
 def trimSequence(job, options, sequenceID, seqStart, seqStop):
-    if options.seqStart is None or options.seqStop is None:
+    if seqStart is None or seqStop is None:
         return sequenceID
     sequenceFile = job.fileStore.readGlobalFile(sequenceID)
     trimmedSequenceFile = job.fileStore.getLocalTempFile()
@@ -102,14 +102,13 @@ def runSampledLastz(job, options, seqID1, seqID2, seedScoresID, sampleSeedThresh
     job.fileStore.logToMaster("Running lastz command: %s" % cmd)
     messages = system(cmd)
     stats = parseStats(statsFile)
-    job.fileStore.exportFile(seq1, toURL("/home/alden/cactusRepeats/seq.txt"))
     job.fileStore.logToMaster("Number of HSPs = %i" % stats["HSPs"])
     job.fileStore.logToMaster("Seeds skipped = %i" % stats["Seeds skipped by sampling"])
 
     return stats
 
 
-def printThresholdVsHSPs(job, options, thresholdValues, statsDicts):
+def printThresholdStats(job, options, thresholdValues, statsDicts):
     job.fileStore.logToMaster("Writing output file...")
     outputFile = job.fileStore.getLocalTempFile()
     with open(outputFile, 'w') as fh:
@@ -117,22 +116,70 @@ def printThresholdVsHSPs(job, options, thresholdValues, statsDicts):
             fh.write("%i %i\n" % (threshold, stats["HSPs"]))
     outputID = job.fileStore.writeGlobalFile(outputFile)
     job.fileStore.exportFile(outputID, toURL(options.outputFile))
+
+def printScalabilityStats(job, statsList):
+    outputFile = job.fileStore.getLocalTempFile()
+    with open(outputFile, 'w') as fh:
+        for stats in statsList:
+            fh.write("%i %i\n" % (stats["target length"], stats["HSPs"]))
+    outputID = job.fileStore.writeGlobalFile(outputFile)
+    job.fileStore.exportFile(outputID, options.outputFile)
+        
+        
     
 def printNumberOfHSPs(job, options, stats):
     job.fileStore.logToMaster("HSPs = %i" % stats["HSPs"])
 def dummyJobFn(job):
     pass
 
+def plotScalability(options):
+    nPoints = 10
+    with Toil(options) as toil:
+        sequenceID = toil.importFile(toURL(options.sequence))
+        seedCountsJob = Job.wrapJobFn(makeRawSeedCounts, options, sequenceID)
+        seedScoreTableJob = Job.wrapJobFn(makeSeedScoresTable, options, rawSeedCountsIDs = [seedCountsJob.rv()])
+        dummyJob = Job.wrapJobFn(dummyJobFn)
+        trimSeqJobs = []
+        lastzJobs = []
+        statsList = []
+        seqStep = options.seqLength/nPoints
+        for i in range(1, nPoints):
+            trimSeqJob = Job.wrapJobFn(trimSequence, options, sequenceID, options.seqStart, options.seqStart + i*seqStep)
+            if options.sampling:
+                lastzJob = Job.wrapJobFn(runSampledLastz, options, trimSeqJob.rv(), trimSeqJob.rv(), seedScoreTableJob.rv(), options.sampleSeedThreshold, options.sampleSeedConstant)
+            else:
+                lastzJob = Job.wrapJobFn(runLastz, options, trimSeqJob.rv(), trimSeqJob.rv())
+            statsList.append(lastzJob.rv())
+            lastzJobs.append(lastzJob)
+            trimSeqJobs.append(trimSeqJob)
+
+        printStatsJob = Job.wrapJobFn(printScalabilityStats, statsList)
+        seedCountsJob.addFollowOn(seedScoreTableJob)
+        seedScoreTableJob.addFollowOn(dummyJob)
+        for trimSeqJob, lastzJob in zip(trimSeqJobs, lastzJobs):
+            dummyJob.addChild(trimSeqJob)
+            trimSeqJob.addFollowOn(lastzJob)
+        dummyJob.addFollowOn(printStatsJob)
+
+        toil.start(seedCountsJob)
+            
+            
+
 def runWorkflow(options):
     with Toil(options) as toil:
         sequenceID = toil.importFile(toURL(options.sequence))
-        fullSequenceID = toil.importFile(toURL(options.fullSequence))
-
-        seedCountsJob = Job.wrapJobFn(makeRawSeedCounts, options, fullSequenceID)
+        if options.fullSequence:
+            fullSequenceID = toil.importFile(toURL(options.fullSequence))
+            seedCountsJob = Job.wrapJobFn(makeRawSeedCounts, options, fullSequenceID)
+        else:
+            seedCountsJob = Job.wrapJobFn(makeRawSeedCounts, options, sequenceID)
         seedScoreTableJob = Job.wrapJobFn(makeSeedScoresTable, options, rawSeedCountsIDs = [seedCountsJob.rv()])
-        trimSeqJob = Job.wrapJobFn(trimSequence, options, sequenceID, options.seqStart, options.seqStop)
+        trimSeqJob = Job.wrapJobFn(trimSequence, options, sequenceID, options.seqStart, options.seqStart + options.seqLength)
 
-        lastzJob = Job.wrapJobFn(runSampledLastz, options, trimSeqJob.rv(), trimSeqJob.rv(), seedScoreTableJob.rv(), sampleSeedThreshold=options.sampleSeedThreshold, sampleSeedConstant=options.sampleSeedConstant)
+        if options.sampling:
+            lastzJob = Job.wrapJobFn(runSampledLastz, options, trimSeqJob.rv(), trimSeqJob.rv(), seedScoreTableJob.rv(), sampleSeedThreshold=options.sampleSeedThreshold, sampleSeedConstant=options.sampleSeedConstant)
+        else:
+            lastzJob = Job.wrapJobFn(runLastz, options, trimSeqJob.rv(), trimSeqJob.rv())
 
         printOutputJob = Job.wrapJobFn(printNumberOfHSPs, options, lastzJob.rv())
 
@@ -145,7 +192,7 @@ def runWorkflow(options):
     
 def plotThreshold(options):
     with Toil(options) as toil:
-        thresholdValues = range(2, 20)
+        thresholdValues = [10*i for i in range(1, 60)]
         sequenceID = toil.importFile(toURL(options.sequence))
         if options.fullSequence:
             fullSequenceID = toil.importFile(toURL(options.fullSequence))
@@ -153,24 +200,24 @@ def plotThreshold(options):
         else:
             seedCountsJob = Job.wrapJobFn(makeRawSeedCounts, options, sequenceID)
         seedScoreTableJob = Job.wrapJobFn(makeSeedScoresTable, options, rawSeedCountsIDs = [seedCountsJob.rv()])
-        trimSeqJob = Job.wrapJobFn(trimSequence, options, sequenceID, options.seqStart, options.seqStop)
+        trimSeqJob = Job.wrapJobFn(trimSequence, options, sequenceID, options.seqStart, options.seqStart+options.seqLength)
         dummyJob = Job.wrapJobFn(dummyJobFn)
 
         lastzJobs = []
         statsDicts = []
         for threshold in thresholdValues:
-            lastzJob = Job.wrapJobFn(runSampledLastz, options, trimSeqJob.rv(), trimSeqJob.rv(), seedScoreTableJob.rv(), sampleSeedThreshold=threshold, sampleSeedConstant=0)
+            lastzJob = Job.wrapJobFn(runSampledLastz, options, trimSeqJob.rv(), trimSeqJob.rv(), seedScoreTableJob.rv(), sampleSeedThreshold=threshold, sampleSeedConstant=0.0)
             statsDicts.append(lastzJob.rv())
             lastzJobs.append(lastzJob)
 
-        printOutputJob = Job.wrapJobFn(printThresholdVsHSPs, options, thresholdValues, statsDicts)
+        printOutputJob = Job.wrapJobFn(printThresholdStats, options, thresholdValues, statsDicts)
 
         seedCountsJob.addFollowOn(seedScoreTableJob)
         seedScoreTableJob.addFollowOn(trimSeqJob)
         trimSeqJob.addFollowOn(dummyJob)
         for lastzJob in lastzJobs:
             dummyJob.addChild(lastzJob)
-            lastzJob.addFollowOn(printOutputJob)
+        dummyJob.addFollowOn(printOutputJob)
 
         toil.start(seedCountsJob)
 
@@ -179,17 +226,16 @@ def main():
 
     #Experiment types
     parser.add_argument("--plotThreshold", action="store_true")
-    parser.add_argument("--runSampled", action="store_true")
-    parser.add_argument("--runUnsampled", action="store_true")
+    parser.add_argument("--plotScalability", action="store_true")
 
     #parameters
-    parser.add_argument("--chunkSize", type=int, default=5000)
-    parser.add_argument("--overlapSize", type=int, default=1000)
+    parser.add_argument("--sampling", type=bool, default=True)
     parser.add_argument("--countThreshold", type=int, default=2)
     parser.add_argument("--sampleSeedThreshold", type=int, default=2)
     parser.add_argument("--sampleSeedConstant", type=int, default=2)
     parser.add_argument("--seqStart", type=int, default=None)
-    parser.add_argument("--seqStop", type=int, default=None)
+    parser.add_argument("--seqLength", type=int, default=None)
+    parser.add_argument("--maxSeqLength", type=int, default=None)
 
     #input and output
     parser.add_argument("--sequence", type=str)
@@ -202,9 +248,9 @@ def main():
 
     if options.plotThreshold:
         plotThreshold(options)
-    elif options.runSampled:
-        runWorkflow(options)
-    elif options.runUnsampled:
+    if options.plotScalability:
+        plotScalability(options)
+    else:
         runWorkflow(options)
 
 
