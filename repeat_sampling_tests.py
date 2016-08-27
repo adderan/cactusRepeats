@@ -54,17 +54,15 @@ def getChunks(job, options, sequenceIDs):
     job.fileStore.logToMaster("Made %i chunks" % len(chunks))
     return [job.fileStore.writeGlobalFile(chunk) for chunk in chunks]
 
-def trimSequence(job, options, sequenceID, seqStart, seqStop):
-    if seqStart is None or seqStop is None:
+def trimSequence(job, options, sequenceID, start, stop):
+    if options.region is None or start is None or stop is None:
         return sequenceID
     sequenceFile = job.fileStore.readGlobalFile(sequenceID)
     trimmedSequenceFile = job.fileStore.getLocalTempFile()
-    for name, seq in fastaRead(sequenceFile):
-        name = name + "|%i_%i" % (seqStart, seqStop)
-        fastaWrite(trimmedSequenceFile, name, seq[seqStart:seqStop])
+    system("samtools faidx %s" % sequenceFile)
+    system("samtools faidx %s %s:%i-%i > %s" % (sequenceFile, options.region, start, stop, trimmedSequenceFile))
     seqID = job.fileStore.writeGlobalFile(trimmedSequenceFile)
     return seqID
-
 
 def parseStats(statsFile):
     """Parse the lastz stats file.
@@ -128,8 +126,6 @@ def printScalabilityStats(job, options, statsList):
             fh.write("%i %i\n" % (stats["target length"], stats["HSPs"]))
     outputID = job.fileStore.writeGlobalFile(outputFile)
     job.fileStore.exportFile(outputID, toURL(options.outputFile))
-
-
 
 def printNumberOfHSPs(job, options, stats):
     job.fileStore.logToMaster("HSPs = %i" % stats["HSPs"])
@@ -240,6 +236,7 @@ def main():
     parser.add_argument("--scoreThreshold", type=int, default=2)
     parser.add_argument("--sampleSeedThreshold", type=int, default=10)
     parser.add_argument("--sampleSeedConstant", type=int, default=10)
+    parser.add_argument("--region", type=str, default=None)
     parser.add_argument("--seqStart", type=int, default=0)
     parser.add_argument("--seqLength", type=int, default=10000)
     parser.add_argument("--maxSeqLength", type=int, default=50000)
