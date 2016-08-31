@@ -2,6 +2,7 @@ import argparse
 import re
 import os
 import shutil
+import xml.etree.ElementTree
 
 from toil.common import Toil
 from toil.job import Job
@@ -10,6 +11,7 @@ from sonLib.bioio import getTempFile
 from sonLib.bioio import fastaRead
 from sonLib.bioio import fastaWrite
 from sonLib.bioio import system
+
 
 def toURL(path):
     if path.startswith("http://"):
@@ -22,22 +24,25 @@ def makeRawSeedCounts(job, options, sequenceID):
     sequence = job.fileStore.readGlobalFile(sequenceID)
     rawSeedCounts = job.fileStore.getLocalTempFile()
     os.system("cPecanLastz --tableonly=count %s[unmask][multiple] > %s" % (sequence, rawSeedCounts))
-    return job.fileStore.writeGlobalFile(rawSeedCounts)
+    countsID =  job.fileStore.writeGlobalFile(rawSeedCounts)
+    return countsID
 
 def makeSeedScoresTable(job, options, rawSeedCountsIDs):
-    if options.seedScoresTable:
-        return job.fileStore.writeGlobalFile(options.seedScoresTable)
+    if options.reuseScoresFile:
+        return job.fileStore.writeGlobalFile(options.seedScoresFile)
     job.fileStore.logToMaster("Making seed scores table...")
     rawSeedCountsFiles = [job.fileStore.readGlobalFile(rawSeedCountsID) for rawSeedCountsID in rawSeedCountsIDs]
     seedScoresTable = job.fileStore.getLocalTempFile()
 
     clusterSeedsOptions = ""
     if options.clusterSeeds:
-        clusterSeedsOptions = "--clusterSeeds --nClusters %i" % options.nClusters
+        clusterSeedsOptions = "--clusterSeeds"
 
     os.system("cactus_blast_makeSeedScoreTable %s --scoreThreshold=%i --seedScoresFile=%s %s"
             % (clusterSeedsOptions, options.scoreThreshold, seedScoresTable, " ".join(rawSeedCountsFiles)))
     seedScoresID = job.fileStore.writeGlobalFile(seedScoresTable)
+    if options.seedScoresFile and not options.reuseScoresFile:
+        job.fileStore.exportFile(seedScoresID, toURL(options.seedScoresFile))
     return seedScoresID
 
 def getChunks(job, options, sequenceIDs):
@@ -61,8 +66,7 @@ def trimSequence(job, options, sequenceID, start, stop):
     trimmedSequenceFile = job.fileStore.getLocalTempFile()
     system("samtools faidx %s" % sequenceFile)
     system("samtools faidx %s %s:%i-%i > %s" % (sequenceFile, options.region, start, stop, trimmedSequenceFile))
-    seqID = job.fileStore.writeGlobalFile(trimmedSequenceFile)
-    return seqID
+    return job.fileStore.writeGlobalFile(trimmedSequenceFile)
 
 def parseStats(statsFile):
     """Parse the lastz stats file.
@@ -90,32 +94,46 @@ def runLastz(job, options, seqID1, seqID2):
     seq2 = job.fileStore.readGlobalFile(seqID2)
     alignmentsFile = job.fileStore.getLocalTempFile()
     statsFile = job.fileStore.getLocalTempFile()
-    os.system("cPecanLastz %s[multiple] %s[multiple] --format=cigar --stats=%s > %s" % (seq1, seq2, statsFile, alignmentsFile))
-    return job.fileStore.writeGlobalFile(statsFile)
+    os.system("cPecanLastz %s[multiple] %s[multiple] --format=maf --stats=%s > %s" % (seq1, seq2, statsFile, alignmentsFile))
+    stats = parseStats(statsFile)
+    return (job.fileStore.writeGlobalFile(alignmentsFile), stats)
 
 
-def runSampledLastz(job, options, seqID1, seqID2, seedScoresID, sampleSeedThreshold, sampleSeedConstant):
-    job.fileStore.logToMaster("Running lastz with seed sampling, threshold = %i, sampling constant = %i ..." % (sampleSeedThreshold, sampleSeedConstant))
+def runSampledLastz(job, options, seqID1, seqID2, seedScoresID, sampleSeedThreshold, sampleSeedStrategy):
+    job.fileStore.logToMaster("Running lastz with seed sampling, threshold = %i, sampling strategy = %s ..." % (sampleSeedThreshold, sampleSeedStrategy))
     seq1 = job.fileStore.readGlobalFile(seqID1)
     seq2 = job.fileStore.readGlobalFile(seqID2)
     seedScores = job.fileStore.readGlobalFile(seedScoresID)
     alignmentsFile = job.fileStore.getLocalTempFile()
     statsFile = job.fileStore.getLocalTempFile()
-    cmd = "cPecanLastz %s[multiple][unmask] %s[multiple][unmask] --notrivial --format=cigar --seedCountsTable=%s --sampleSeedThreshold=%i --sampleSeedConstant=%i --stats=%s > %s" % (seq1, seq2, seedScores, sampleSeedThreshold, sampleSeedConstant, statsFile, alignmentsFile)
+    cmd = "cPecanLastz %s[multiple][unmask] %s[multiple][unmask] --notrivial --format=maf --seedCountsTable=%s --sampleSeedThreshold=%i --sampleSeedStrategy=%s --stats=%s > %s" % (seq1, seq2, seedScores, sampleSeedThreshold, sampleSeedStrategy, statsFile, alignmentsFile)
     job.fileStore.logToMaster("Running lastz command: %s" % cmd)
     messages = system(cmd)
     stats = parseStats(statsFile)
     job.fileStore.logToMaster("Number of HSPs = %i" % stats["HSPs"])
     job.fileStore.logToMaster("Seeds skipped = %i" % stats["Seeds skipped by sampling"])
+    return (job.fileStore.writeGlobalFile(alignmentsFile), stats)
 
-    return stats
+def alignmentPrecisionRecall(job, options, maskedAlignmentsID, sampledAlignmentsID):
+    maskedAlignments = job.fileStore.readGlobalFile(maskedAlignmentsID)
+    sampledAlignments = job.fileStore.readGlobalFile(sampledAlignmentsID)
+    precisionRecall = job.fileStore.getLocalTempFile()
+    system("mafComparator --maf1=%s --maf2=%s --out=%s" % (maskedAlignments, sampledAlignments, precisionRecall))
+    precisionRecallID = job.fileStore.writeGlobalFile(precisionRecall)
+    precisionRecallXML = xml.etree.ElementTree.parse(precisionRecall).getroot()
+    precision = float(precisionRecallXML[0][0][0].attrib["average"])
+    recall = float(precisionRecallXML[1][0][0].attrib["average"])
+    job.fileStore.logToMaster("Precision = %f, recall = %f" % (precision, recall))
+    if options.precisionRecallFile:
+        job.fileStore.exportFile(precisionRecallID, toURL(options.precisionRecallFile))
+    return (precision, recall)
 
 def printThresholdStats(job, options, thresholdValues, statsDicts):
     job.fileStore.logToMaster("Writing output file...")
     outputFile = job.fileStore.getLocalTempFile()
     with open(outputFile, 'w') as fh:
         for threshold, stats in zip(thresholdValues, statsDicts):
-            fh.write("%i %i\n" % (threshold, stats["HSPs"]))
+            fh.write("%i\t%i\n" % (threshold, stats["HSPs"]))
     outputID = job.fileStore.writeGlobalFile(outputFile)
     job.fileStore.exportFile(outputID, toURL(options.outputFile))
 
@@ -133,7 +151,7 @@ def dummyJobFn(job):
     pass
 
 def plotScalability(options):
-    nPoints = 10
+    nPoints = 20
     with Toil(options) as toil:
         sequenceID = toil.importFile(toURL(options.sequence))
         seedCountsJob = Job.wrapJobFn(makeRawSeedCounts, options, sequenceID)
@@ -146,10 +164,10 @@ def plotScalability(options):
         for i in range(1, nPoints):
             trimSeqJob = Job.wrapJobFn(trimSequence, options, sequenceID, options.seqStart, options.seqStart + i*seqStep)
             if options.sampleSeeds:
-                lastzJob = Job.wrapJobFn(runSampledLastz, options, trimSeqJob.rv(), trimSeqJob.rv(), seedScoreTableJob.rv(), options.sampleSeedThreshold, options.sampleSeedConstant)
+                lastzJob = Job.wrapJobFn(runSampledLastz, options, trimSeqJob.rv(), trimSeqJob.rv(), seedScoreTableJob.rv(), options.sampleSeedThreshold, options.sampleSeedStrategy)
             else:
                 lastzJob = Job.wrapJobFn(runLastz, options, trimSeqJob.rv(), trimSeqJob.rv())
-            statsList.append(lastzJob.rv())
+            statsList.append(lastzJob.rv(1))
             lastzJobs.append(lastzJob)
             trimSeqJobs.append(trimSeqJob)
 
@@ -163,42 +181,52 @@ def plotScalability(options):
 
         toil.start(seedCountsJob)
 
-
-
 def runWorkflow(options):
     with Toil(options) as toil:
         sequenceID = toil.importFile(toURL(options.sequence))
-        if options.fullSequence:
-            fullSequenceID = toil.importFile(toURL(options.fullSequence))
-            seedCountsJob = Job.wrapJobFn(makeRawSeedCounts, options, fullSequenceID)
-        else:
-            seedCountsJob = Job.wrapJobFn(makeRawSeedCounts, options, sequenceID)
-        seedScoreTableJob = Job.wrapJobFn(makeSeedScoresTable, options, rawSeedCountsIDs = [seedCountsJob.rv()])
         trimSeqJob = Job.wrapJobFn(trimSequence, options, sequenceID, options.seqStart, options.seqStart + options.seqLength)
 
         if options.sampleSeeds:
-            lastzJob = Job.wrapJobFn(runSampledLastz, options, trimSeqJob.rv(), trimSeqJob.rv(), seedScoreTableJob.rv(), sampleSeedThreshold=options.sampleSeedThreshold, sampleSeedConstant=options.sampleSeedConstant)
+            seedCountsJob = Job.wrapJobFn(makeRawSeedCounts, options, sequenceID)
+            seedScoreTableJob = Job.wrapJobFn(makeSeedScoresTable, options, rawSeedCountsIDs = [seedCountsJob.rv()])
+            lastzJob = Job.wrapJobFn(runSampledLastz, options, trimSeqJob.rv(), trimSeqJob.rv(), seedScoreTableJob.rv(), sampleSeedThreshold=options.sampleSeedThreshold, sampleSeedStrategy=options.sampleSeedStrategy)
+
+            trimSeqJob.addFollowOn(seedCountsJob)
+            seedCountsJob.addFollowOn(seedScoreTableJob)
+            seedScoreTableJob.addFollowOn(lastzJob)
         else:
             lastzJob = Job.wrapJobFn(runLastz, options, trimSeqJob.rv(), trimSeqJob.rv())
+            trimSeqJob.addFollowOn(lastzJob)
 
-        printOutputJob = Job.wrapJobFn(printNumberOfHSPs, options, lastzJob.rv())
-
-        seedCountsJob.addFollowOn(seedScoreTableJob)
-        seedScoreTableJob.addFollowOn(trimSeqJob)
-        trimSeqJob.addFollowOn(lastzJob)
+        printOutputJob = Job.wrapJobFn(printNumberOfHSPs, options, lastzJob.rv(1))
         lastzJob.addFollowOn(printOutputJob)
-        toil.start(seedCountsJob)
+
+        toil.start(trimSeqJob)
+def comparePrecisionRecall(options):
+    with Toil(options) as toil:
+        sequenceID = toil.importFile(toURL(options.sequence))
+        trimSeqJob = Job.wrapJobFn(trimSequence, options, sequenceID, options.seqStart, options.seqStart + options.seqLength)
+
+        seedCountsJob = Job.wrapJobFn(makeRawSeedCounts, options, sequenceID)
+        seedScoreTableJob = Job.wrapJobFn(makeSeedScoresTable, options, rawSeedCountsIDs = [seedCountsJob.rv()])
+        sampledLastzJob = Job.wrapJobFn(runSampledLastz, options, trimSeqJob.rv(), trimSeqJob.rv(), seedScoreTableJob.rv(), sampleSeedThreshold=options.sampleSeedThreshold, sampleSeedStrategy = options.sampleSeedStrategy)
+
+        maskedLastzJob = Job.wrapJobFn(runLastz, options, trimSeqJob.rv(), trimSeqJob.rv())
+
+        precisionRecallJob = Job.wrapJobFn(alignmentPrecisionRecall, options, maskedLastzJob.rv(0), sampledLastzJob.rv(0))
+        trimSeqJob.addFollowOn(seedCountsJob)
+        seedCountsJob.addFollowOn(seedScoreTableJob)
+        seedScoreTableJob.addFollowOn(sampledLastzJob)
+        sampledLastzJob.addFollowOn(maskedLastzJob)
+        maskedLastzJob.addFollowOn(precisionRecallJob)
+        toil.start(trimSeqJob)
 
 
 def plotThreshold(options):
     with Toil(options) as toil:
         thresholdValues = [options.thresholdMin + options.thresholdStep*i for i in range(options.thresholdNValues)]
         sequenceID = toil.importFile(toURL(options.sequence))
-        if options.fullSequence:
-            fullSequenceID = toil.importFile(toURL(options.fullSequence))
-            seedCountsJob = Job.wrapJobFn(makeRawSeedCounts, options, fullSequenceID)
-        else:
-            seedCountsJob = Job.wrapJobFn(makeRawSeedCounts, options, sequenceID)
+        seedCountsJob = Job.wrapJobFn(makeRawSeedCounts, options, sequenceID)
         seedScoreTableJob = Job.wrapJobFn(makeSeedScoresTable, options, rawSeedCountsIDs = [seedCountsJob.rv()])
         trimSeqJob = Job.wrapJobFn(trimSequence, options, sequenceID, options.seqStart, options.seqStart+options.seqLength)
         dummyJob = Job.wrapJobFn(dummyJobFn)
@@ -206,8 +234,8 @@ def plotThreshold(options):
         lastzJobs = []
         statsDicts = []
         for threshold in thresholdValues:
-            lastzJob = Job.wrapJobFn(runSampledLastz, options, trimSeqJob.rv(), trimSeqJob.rv(), seedScoreTableJob.rv(), sampleSeedThreshold=threshold, sampleSeedConstant=0.0)
-            statsDicts.append(lastzJob.rv())
+            lastzJob = Job.wrapJobFn(runSampledLastz, options, trimSeqJob.rv(), trimSeqJob.rv(), seedScoreTableJob.rv(), sampleSeedThreshold=threshold, sampleSeedStrategy="rejectAll")
+            statsDicts.append(lastzJob.rv(1))
             lastzJobs.append(lastzJob)
 
         printOutputJob = Job.wrapJobFn(printThresholdStats, options, thresholdValues, statsDicts)
@@ -227,15 +255,15 @@ def main():
     #Experiment types
     parser.add_argument("--plotThreshold", action="store_true")
     parser.add_argument("--plotScalability", action="store_true")
+    parser.add_argument("--comparePrecisionRecall", action="store_true")
 
     #parameters
     parser.add_argument("--sampleSeeds", action="store_true")
     parser.add_argument("--clusterSeeds", action="store_true");
 
-    parser.add_argument("--nClusters", type=int, default=100)
     parser.add_argument("--scoreThreshold", type=int, default=2)
     parser.add_argument("--sampleSeedThreshold", type=int, default=10)
-    parser.add_argument("--sampleSeedConstant", type=int, default=10)
+    parser.add_argument("--sampleSeedStrategy", type=str, default="constantSampling")
     parser.add_argument("--region", type=str, default=None)
     parser.add_argument("--seqStart", type=int, default=0)
     parser.add_argument("--seqLength", type=int, default=10000)
@@ -248,8 +276,9 @@ def main():
 
     #input and output
     parser.add_argument("--sequence", type=str)
-    parser.add_argument("--fullSequence", type=str)
-    parser.add_argument("--seedScoresTable", type=str, default=None)
+    parser.add_argument("--seedScoresFile", type=str, default=None)
+    parser.add_argument("--reuseScoresFile", action="store_true")
+    parser.add_argument("--precisionRecallFile", type=str, default=None)
     parser.add_argument("--outputFile", type=str)
 
     Job.Runner.addToilOptions(parser)
@@ -260,6 +289,8 @@ def main():
         plotThreshold(options)
     elif options.plotScalability:
         plotScalability(options)
+    elif options.comparePrecisionRecall:
+        comparePrecisionRecall(options)
     else:
         runWorkflow(options)
 
