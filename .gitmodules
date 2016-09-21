@@ -1,0 +1,6 @@
+[submodule "maftools"]
+	path = maftools
+	url = https://github.com/dentearl/maftools
+[submodule "sonLib"]
+	path = sonLib
+	url = https://github.com/benedictpaten/sonLib

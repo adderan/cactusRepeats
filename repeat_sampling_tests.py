@@ -27,37 +27,44 @@ def makeRawSeedCounts(job, options, sequenceID):
     countsID =  job.fileStore.writeGlobalFile(rawSeedCounts)
     return countsID
 
-def makeSeedScoresTable(job, options, rawSeedCountsIDs):
-    if options.reuseScoresFile:
-        return job.fileStore.writeGlobalFile(options.seedScoresFile)
-    job.fileStore.logToMaster("Making seed scores table...")
-    rawSeedCountsFiles = [job.fileStore.readGlobalFile(rawSeedCountsID) for rawSeedCountsID in rawSeedCountsIDs]
-    seedScoresTable = job.fileStore.getLocalTempFile()
+def makeSeedProbabilities(job, options, sequenceID, countsTableID, graphID):
+    countsTable = job.fileStore.readGlobalFile(countsTableID)
+    sequence = job.fileStore.readGlobalFile(sequenceID)
+    deBruijnGraph = job.fileStore.readGlobalFile(graphID)
+    if options.reuseProbabilitiesFile:
+        return job.fileStore.writeGlobalFile(options.seedProbabilitiesFilename)
+    seedProbabilities = job.fileStore.getLocalTempFile()
 
-    clusterSeedsOptions = ""
+    flags = ""
     if options.clusterSeeds:
-        clusterSeedsOptions = "--clusterSeeds"
+        flags += "--clusterSeeds"
+    if options.seedMultiplicity:
+        flags += "--seedMultiplicity"
+    if options.pathMultiplicity:
+        flags += "--pathMultiplicity"
 
-    os.system("cactus_blast_makeSeedScoreTable %s --scoreThreshold=%i --seedScoresFile=%s %s"
-            % (clusterSeedsOptions, options.scoreThreshold, seedScoresTable, " ".join(rawSeedCountsFiles)))
-    seedScoresID = job.fileStore.writeGlobalFile(seedScoresTable)
-    if options.seedScoresFile and not options.reuseScoresFile:
-        job.fileStore.exportFile(seedScoresID, toURL(options.seedScoresFile))
-    return seedScoresID
+    os.system("cactus_repeats_seedProbabilities %s --seedMultiplicitiy --sequenceFile %s --graphFile %s --lastzFile %s > %s"
+            % (flags, sequence, deBruijnGraph, countsTable, seedProbabilities))
+    seedProbabilitiesID = job.fileStore.writeGlobalFile(seedProbabilities)
+    if options.seedProbabilitiesFilename and not options.reuseProbabilitiesFile:
+        job.fileStore.exportFile(seedProbabilitiesID, toURL(options.seedProbabilitiesFilename))
+    return seedProbabilitiesID
 
-def getChunks(job, options, sequenceIDs):
-    job.fileStore.logToMaster("Making chunks....")
-    sequences = [job.fileStore.readGlobalFile(sequenceID) for sequenceID in sequenceIDs]
-    chunksDir = os.path.join(job.fileStore.getLocalTempDir(), "chunks")
-    os.makedirs(chunksDir)
-    chunks = [ chunk for chunk in popenCatch("cactus_blast_chunkSequences %s %i %i %s %s" % \
-                                                          ("DEBUG",
-                                                          options.chunkSize,
-                                                          options.overlapSize,
-                                                          chunksDir,
-                                                          " ".join(sequences))).split("\n") if chunk != "" ]
-    job.fileStore.logToMaster("Made %i chunks" % len(chunks))
-    return [job.fileStore.writeGlobalFile(chunk) for chunk in chunks]
+def makeDeBruijnGraph(job, options, sequenceID):
+    job.fileStore.logToMaster("Making de bruijn graph for input genome...")
+    sequence = job.fileStore.readGlobalFile(sequenceID)
+    tmpDir = job.fileStore.getLocalTempDir()
+    os.system("twopaco -f %i %s -k %i --tmpdir %s" % (options.filterSize, sequence, 
+        options.k, tmpDir))
+    return job.fileStore.writeGlobalFile(os.path.join(tmpDir, "de_bruijn.bin"))
+
+
+def makeSeedProbabilitiesFromDeBruinPaths(job, options, deBruijnID, sequenceID):
+    sequence = job.fileStore.readGlobalFile(sequenceID)
+    deBruijn = job.fileStore.readGlobalFile(deBruijnID)
+    seedProbabilitiesFile = job.fileStore.getLocalTempFile()
+    os.system("cactus_repeats_seedMultiplicity --graphFilename %s --sequenceFilename %s --k %i > %s" % (deBruijn, sequence, options.k))
+    return job.fileStore.writeGlobalFile(seedProbabilitiesFile)
 
 def trimSequence(job, options, sequenceID, start, stop):
     if options.region is None or start is None or stop is None:
@@ -99,14 +106,13 @@ def runLastz(job, options, seqID1, seqID2):
     return (job.fileStore.writeGlobalFile(alignmentsFile), stats)
 
 
-def runSampledLastz(job, options, seqID1, seqID2, seedScoresID, sampleSeedThreshold, sampleSeedStrategy):
-    job.fileStore.logToMaster("Running lastz with seed sampling, threshold = %i, sampling strategy = %s ..." % (sampleSeedThreshold, sampleSeedStrategy))
+def runSampledLastz(job, options, seqID1, seqID2, seedProbabilitiesID):
     seq1 = job.fileStore.readGlobalFile(seqID1)
     seq2 = job.fileStore.readGlobalFile(seqID2)
-    seedScores = job.fileStore.readGlobalFile(seedScoresID)
+    seedProbabilities = job.fileStore.readGlobalFile(seedProbabilitiesID)
     alignmentsFile = job.fileStore.getLocalTempFile()
     statsFile = job.fileStore.getLocalTempFile()
-    cmd = "cPecanLastz %s[multiple][unmask] %s[multiple][unmask] --notrivial --format=maf --seedCountsTable=%s --sampleSeedThreshold=%i --sampleSeedStrategy=%s --stats=%s > %s" % (seq1, seq2, seedScores, sampleSeedThreshold, sampleSeedStrategy, statsFile, alignmentsFile)
+    cmd = "cPecanLastz %s[multiple][unmask] %s[multiple][unmask] --notrivial --format=maf --sampleSeeds --seedSamplingProbabilities=%s --stats=%s > %s" % (seq1, seq2, seedProbabilities, statsFile, alignmentsFile)
     job.fileStore.logToMaster("Running lastz command: %s" % cmd)
     messages = system(cmd)
     stats = parseStats(statsFile)
@@ -155,7 +161,7 @@ def plotScalability(options):
     with Toil(options) as toil:
         sequenceID = toil.importFile(toURL(options.sequence))
         seedCountsJob = Job.wrapJobFn(makeRawSeedCounts, options, sequenceID)
-        seedScoreTableJob = Job.wrapJobFn(makeSeedScoresTable, options, rawSeedCountsIDs = [seedCountsJob.rv()])
+        seedProbabilitiesJob = Job.wrapJobFn(makeSeedProbabilities, options, sequenceID)
         dummyJob = Job.wrapJobFn(dummyJobFn)
         trimSeqJobs = []
         lastzJobs = []
@@ -164,7 +170,7 @@ def plotScalability(options):
         for i in range(1, nPoints):
             trimSeqJob = Job.wrapJobFn(trimSequence, options, sequenceID, options.seqStart, options.seqStart + i*seqStep)
             if options.sampleSeeds:
-                lastzJob = Job.wrapJobFn(runSampledLastz, options, trimSeqJob.rv(), trimSeqJob.rv(), seedScoreTableJob.rv(), options.sampleSeedThreshold, options.sampleSeedStrategy)
+                lastzJob = Job.wrapJobFn(runSampledLastz, options, trimSeqJob.rv(), trimSeqJob.rv(), seedProbabilitiesJob.rv())
             else:
                 lastzJob = Job.wrapJobFn(runLastz, options, trimSeqJob.rv(), trimSeqJob.rv())
             statsList.append(lastzJob.rv(1))
@@ -172,8 +178,8 @@ def plotScalability(options):
             trimSeqJobs.append(trimSeqJob)
 
         printStatsJob = Job.wrapJobFn(printScalabilityStats, options, statsList)
-        seedCountsJob.addFollowOn(seedScoreTableJob)
-        seedScoreTableJob.addFollowOn(dummyJob)
+        seedCountsJob.addFollowOn(seedProbabilitiesJob)
+        seedProbabilitiesJob.addFollowOn(dummyJob)
         for trimSeqJob, lastzJob in zip(trimSeqJobs, lastzJobs):
             dummyJob.addChild(trimSeqJob)
             trimSeqJob.addFollowOn(lastzJob)
@@ -188,12 +194,16 @@ def runWorkflow(options):
 
         if options.sampleSeeds:
             seedCountsJob = Job.wrapJobFn(makeRawSeedCounts, options, sequenceID)
-            seedScoreTableJob = Job.wrapJobFn(makeSeedScoresTable, options, rawSeedCountsIDs = [seedCountsJob.rv()])
-            lastzJob = Job.wrapJobFn(runSampledLastz, options, trimSeqJob.rv(), trimSeqJob.rv(), seedScoreTableJob.rv(), sampleSeedThreshold=options.sampleSeedThreshold, sampleSeedStrategy=options.sampleSeedStrategy)
-
+            deBruijnGraphJob = Job.wrapJobFn(makeDeBruijnGraph, options, sequenceID)
             trimSeqJob.addFollowOn(seedCountsJob)
-            seedCountsJob.addFollowOn(seedScoreTableJob)
-            seedScoreTableJob.addFollowOn(lastzJob)
+            seedCountsJob.addFollowOn(deBruijnGraphJob)
+
+            seedProbabilitiesJob = Job.wrapJobFn(makeSeedProbabilities, options, sequenceID, seedCountsJob.rv(), graphID=deBruijnGraphJob.rv())
+            seedCountsJob.addFollowOn(seedProbabilitiesJob)
+            lastzJob = Job.wrapJobFn(runSampledLastz, options, trimSeqJob.rv(), trimSeqJob.rv(), seedProbabilitiesJob.rv())
+
+            seedProbabilitiesJob.addFollowOn(lastzJob)
+
         else:
             lastzJob = Job.wrapJobFn(runLastz, options, trimSeqJob.rv(), trimSeqJob.rv())
             trimSeqJob.addFollowOn(lastzJob)
@@ -205,18 +215,17 @@ def runWorkflow(options):
 def comparePrecisionRecall(options):
     with Toil(options) as toil:
         sequenceID = toil.importFile(toURL(options.sequence))
+        seedCountsJob = Job.wrapJobFn(makeRawSeedCounts, options, sequenceID)
         trimSeqJob = Job.wrapJobFn(trimSequence, options, sequenceID, options.seqStart, options.seqStart + options.seqLength)
 
-        seedCountsJob = Job.wrapJobFn(makeRawSeedCounts, options, sequenceID)
-        seedScoreTableJob = Job.wrapJobFn(makeSeedScoresTable, options, rawSeedCountsIDs = [seedCountsJob.rv()])
-        sampledLastzJob = Job.wrapJobFn(runSampledLastz, options, trimSeqJob.rv(), trimSeqJob.rv(), seedScoreTableJob.rv(), sampleSeedThreshold=options.sampleSeedThreshold, sampleSeedStrategy = options.sampleSeedStrategy)
+        seedProbabilitiesJob = Job.wrapJobFn(makeSeedProbabilities, options, sequenceID)
+        sampledLastzJob = Job.wrapJobFn(runSampledLastz, options, trimSeqJob.rv(), trimSeqJob.rv(), seedProbabilitiesJob.rv())
 
         maskedLastzJob = Job.wrapJobFn(runLastz, options, trimSeqJob.rv(), trimSeqJob.rv())
 
         precisionRecallJob = Job.wrapJobFn(alignmentPrecisionRecall, options, maskedLastzJob.rv(0), sampledLastzJob.rv(0))
-        trimSeqJob.addFollowOn(seedCountsJob)
-        seedCountsJob.addFollowOn(seedScoreTableJob)
-        seedScoreTableJob.addFollowOn(sampledLastzJob)
+        trimSeqJob.addFollowOn(seedProbabilitiesJob)
+        seedProbabilitiesJob.addFollowOn(sampledLastzJob)
         sampledLastzJob.addFollowOn(maskedLastzJob)
         maskedLastzJob.addFollowOn(precisionRecallJob)
         toil.start(trimSeqJob)
@@ -226,28 +235,26 @@ def plotThreshold(options):
     with Toil(options) as toil:
         thresholdValues = [options.thresholdMin + options.thresholdStep*i for i in range(options.thresholdNValues)]
         sequenceID = toil.importFile(toURL(options.sequence))
-        seedCountsJob = Job.wrapJobFn(makeRawSeedCounts, options, sequenceID)
-        seedScoreTableJob = Job.wrapJobFn(makeSeedScoresTable, options, rawSeedCountsIDs = [seedCountsJob.rv()])
+        seedProbabilitiesJob = Job.wrapJobFn(makeSeedProbabilities, options, sequenceID)
         trimSeqJob = Job.wrapJobFn(trimSequence, options, sequenceID, options.seqStart, options.seqStart+options.seqLength)
         dummyJob = Job.wrapJobFn(dummyJobFn)
 
         lastzJobs = []
         statsDicts = []
         for threshold in thresholdValues:
-            lastzJob = Job.wrapJobFn(runSampledLastz, options, trimSeqJob.rv(), trimSeqJob.rv(), seedScoreTableJob.rv(), sampleSeedThreshold=threshold, sampleSeedStrategy="rejectAll")
+            lastzJob = Job.wrapJobFn(runSampledLastz, options, trimSeqJob.rv(), trimSeqJob.rv(), seedProbabilitiesJob.rv())
             statsDicts.append(lastzJob.rv(1))
             lastzJobs.append(lastzJob)
 
         printOutputJob = Job.wrapJobFn(printThresholdStats, options, thresholdValues, statsDicts)
 
-        seedCountsJob.addFollowOn(seedScoreTableJob)
-        seedScoreTableJob.addFollowOn(trimSeqJob)
+        seedProbabilitiesJob.addFollowOn(trimSeqJob)
         trimSeqJob.addFollowOn(dummyJob)
         for lastzJob in lastzJobs:
             dummyJob.addChild(lastzJob)
         dummyJob.addFollowOn(printOutputJob)
 
-        toil.start(seedCountsJob)
+        toil.start(seedProbabilitiesJob)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -259,7 +266,9 @@ def main():
 
     #parameters
     parser.add_argument("--sampleSeeds", action="store_true")
-    parser.add_argument("--clusterSeeds", action="store_true");
+    parser.add_argument("--clusterSeeds", action="store_true")
+    parser.add_argument("--seedMultiplicity", action="store_true")
+    parser.add_argument("--pathMultiplicity", action="store_true")
 
     parser.add_argument("--scoreThreshold", type=int, default=2)
     parser.add_argument("--sampleSeedThreshold", type=int, default=10)
@@ -268,6 +277,9 @@ def main():
     parser.add_argument("--seqStart", type=int, default=0)
     parser.add_argument("--seqLength", type=int, default=10000)
     parser.add_argument("--maxSeqLength", type=int, default=50000)
+    parser.add_argument("--k", type=int, default=19)
+    parser.add_argument("--filterSize", type=int, default=10)
+    parser.add_argument("--seedPattern", type=str, default="1110100110010101111")
 
     #options for plotting sample threshold
     parser.add_argument("--thresholdMin", type=int, default=2)
@@ -276,8 +288,8 @@ def main():
 
     #input and output
     parser.add_argument("--sequence", type=str)
-    parser.add_argument("--seedScoresFile", type=str, default=None)
-    parser.add_argument("--reuseScoresFile", action="store_true")
+    parser.add_argument("--seedProbabilitiesFilename", type=str, default=None)
+    parser.add_argument("--reuseProbabilitiesFile", action="store_true")
     parser.add_argument("--precisionRecallFile", type=str, default=None)
     parser.add_argument("--outputFile", type=str)
 
